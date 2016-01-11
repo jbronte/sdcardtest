@@ -1,7 +1,3 @@
-// TODO:
-//    - add signal handling, see if writes can be interrupted
-//    - add rand+crc tests
-
 /*!
  * @file sdtest.c
  * @brief Test application for SD Card longevity tests
@@ -77,6 +73,7 @@ typedef struct globals_s
    device_info_t     di;                  // struct to hold device information
    test_type_e       test_type;           // zero+ones or rand+crc
    char              *devicename;         // block device node /dev/sdX
+   char              *message;            // message - use for part #
    char              *statslogname;       // generated filename for log and stats
    int               dumpinfo;            // flag to dump device info
    int               verbose;             // flag to print each buffer IO
@@ -92,6 +89,7 @@ typedef struct globals_s
    int               quitpasses;          // count to quit after N passes
    bwt_t             buffer_bw;           // timers and counts for buffer bandwidth
    FILE              *logfd;
+   unsigned char     *randbuf;
 } globals_t;
 
 //-----------------------------------------------------------------------------
@@ -143,10 +141,15 @@ static void stats_log_setup(globals_t *g)
    }
 
    LOG("devicename=%s\n", g->devicename);
+   LOG("size=%lu(0x%lx)\n", g->di.size,g->di.size);
+   LOG("sectors=%lu(0x%lx)\n", g->di.sectors,g->di.sectors);
    LOG("starttime=%s\n", gettime());
    LOG("block_size=%u\n", g->block_size);
    LOG("block_writes=%u\n", g->block_writes);
    LOG("buffer_size=%u\n", g->buffer_size);
+   if (g->message)
+      LOG("message=%s\n",g->message);
+
 }
 
 /*!
@@ -170,6 +173,10 @@ static void get_previous_counts(globals_t *g)
    token= strtok_r(s1, ":", &s1);
    g->pass_count = strtoul(token,&endptr,0);
    LOG("Restarting with Total written: %lu Pass count: %lu\n", g->written_total, g->pass_count);
+   LOG("devicename=%s\n", g->devicename);
+   LOG("starttime=%s\n", gettime());
+   if (g->message)
+      LOG("message=%s\n",g->message);
 }
 
 
@@ -205,6 +212,7 @@ static void usage(char *cmd)
    printf("  -T               add timestamps to output\n");
    printf("  -Z               zero stats if present\n");
    printf("  -O               log to stdout as well as logfile\n");
+   printf("  -m <message>     quoted string message, use for part #\n");
    printf("  -t <test type>   where 'z' is zeroes/ones, 'r' is random with CRCs\n");
    printf("  -b <buffer size> override default buffer size of 134217728 (modulo 1048576) \n");
    printf("  -q <passes>      quit after number of passes\n");
@@ -228,7 +236,7 @@ static void parse_cmdline(globals_t *g, int argc, char **argv)
    }
 
    // parse the command options
-   while ((c = getopt(argc, argv, "hivTZOt:b:q:")) != -1)
+   while ((c = getopt(argc, argv, "hivTZOm:t:b:q:")) != -1)
       switch (c) {
          case 't': g->test_type = (optarg[0] == 'z') ? ZERO : \
                                   (optarg[0] == 'r') ? RAND : 0; break;
@@ -239,6 +247,7 @@ static void parse_cmdline(globals_t *g, int argc, char **argv)
          case 'O': g->logstdout++;                               break;
          case 'b': g->buffer_size = strtoul(optarg,&endptr,0);   break;
          case 'q': g->quitpasses = strtoul(optarg,&endptr,0);    break;
+         case 'm': g->message = strdup(optarg);                  break;
          case '?':
          case 'h':
          usage(argv[0]);
@@ -259,6 +268,37 @@ static void parse_cmdline(globals_t *g, int argc, char **argv)
       usage(argv[0]);
       exit(-1);
    }
+}
+
+/* /dev/urandom will only return 0x1fffff bytes, I'll assume this is */
+/* the prbs wrapping around. Rather than using /dev/urandom directly */
+/* I'll make a rand buffer 2xblock_size and increment the pointer    */
+/* each write to change data, unfortunately, to use direct IO, we    */
+/* have to copy from the rand buf into the aligned wbuf each time    */
+static unsigned char *create_randbuf(globals_t *g, int bufsize)
+{
+   unsigned char *buf;
+   int bytes_read = 0;
+   int bytes = 0;
+   int fd;
+
+   buf = malloc(bufsize);
+   if (buf < 0) {fprintf(stderr, "ERROR: could not allocate random buffer!\n");exit(-1);}
+
+   fd = open("/dev/urandom", O_RDONLY);
+   if (fd < 0) {fprintf(stderr, "ERROR: could not open /dev/urandom!\n");exit(-1);}
+
+   while (bytes_read < bufsize)
+   {
+      bytes = read(fd, buf+bytes_read, bufsize-bytes_read);
+      if (bytes < 0) {
+         perror("read /dev/urandom");
+         exit(-1);
+      }
+      bytes_read += bytes;
+   }
+   close(fd);
+   return buf;
 }
 
 /*!
@@ -283,6 +323,7 @@ static int device_setup(globals_t *g)
    ioctl(fd, BLKIOMIN,     &g->di.min_io_size);
    ioctl(fd, BLKIOOPT,     &g->di.opt_io_size);
    ioctl(fd, BLKALIGNOFF,  &g->di.alignment_offset);
+   close(fd);
 
    if (!g->di.opt_io_size)
       g->di.opt_io_size = g->di.min_io_size;
@@ -314,9 +355,36 @@ static int device_setup(globals_t *g)
       g->block_size = g->buffer_size;
       g->block_writes = (unsigned int)(g->di.size / g->buffer_size);
    }
+   if (g->test_type == RAND)
+      g->randbuf = create_randbuf(g, g->block_size * 2);
 
-   close(fd);
    return 0;
+}
+
+#if 0
+static void dump_buffer( unsigned char * pBuf, int iLen )
+{
+    int iCount = 0;
+    while( iCount < iLen) {
+        if ( iCount % 16 ) printf("\n");
+        printf(" %2.2X", *pBuf);
+        ++pBuf;
+        --iLen;
+    }
+    printf("\n");
+}
+#endif
+/*!
+ * @brief Write Rand
+ *
+ */
+static void write_rand(globals_t *g, unsigned char *buf, unsigned int size)
+{
+   static unsigned int offset = 0;
+   memcpy(buf, g->randbuf+offset, size);
+   offset++;
+   if (offset > size)
+      offset = 0;
 }
 
 /*!
@@ -367,9 +435,12 @@ static int device_test(globals_t *g)
       // within each pass are blocks, where each block is tested
       while(index < g->block_writes)
       {
-         // write ones:
+         // write ones or rand:
          lseek(fd, index*g->block_size, SEEK_SET);
-         memset(wbuf, 0xFF, g->block_size);
+         if (g->test_type == ZERO)
+            memset(wbuf, 0xFF, g->block_size);
+         else
+            write_rand(g, wbuf, g->block_size);
          measurebw(1, 0, &g->buffer_bw);
          write(fd, wbuf, g->block_size);
          buffer_wrbps1 = measurebw(0, g->block_size, &g->buffer_bw);
@@ -398,6 +469,13 @@ static int device_test(globals_t *g)
 
          if (memcmp(rbuf,wbuf,g->block_size))
          {
+            FILE *fd = fopen("wbuf","w+");
+            fwrite(wbuf,1,g->block_size,fd);
+            fclose(fd);
+            fd = fopen("rbuf","w+");
+            fwrite(rbuf,1,g->block_size,fd);
+            fclose(fd);
+
             LOG("error at block %d, exiting...\n", index);
             rc = -1;
             goto done;
@@ -417,9 +495,12 @@ static int device_test(globals_t *g)
                (unsigned int)(buffer_rdbps1%1000000));
          }
 
-         // write zeroes:
+         // write zeroes or rand:
          lseek(fd, index*g->block_size, SEEK_SET);
-         memset(wbuf, 0, g->block_size);
+         if (g->test_type == ZERO)
+            memset(wbuf, 0, g->block_size);
+         else
+            write_rand(g, wbuf, g->block_size);
          measurebw(1, 0, &g->buffer_bw);
          write(fd, wbuf, g->block_size);
          buffer_wrbps2 = measurebw(0, g->block_size, &g->buffer_bw);
@@ -652,6 +733,5 @@ static uint32_t crc32(uint32_t crc, const void *buf, size_t size)
 
 	return crc ^ ~0U;
 }
-
 
 /*================================== EOF ====================================*/
